@@ -57,72 +57,6 @@ Create a `.env` file (optional) or set envs in `docker-compose.yml`.
 
 ## 3) Quick start with Docker Compose
 
-**Example `docker-compose.yml`**:
-
-```yaml
-version: "3.9"
-services:
-  qdrant:
-    image: qdrant/qdrant:latest
-    container_name: qdrant
-    ports:
-      - "6333:6333"
-    volumes:
-      - qdrant_data:/qdrant/storage
-
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    environment:
-      - OLLAMA_KEEP_ALIVE=24h
-
-  llama-stack:
-    image: vllm/vllm-openai:latest
-    container_name: llama-stack
-    ports:
-      - "8080:8000"
-    command:
-      - --model
-      - meta-llama/Llama-3.2-3B-Instruct
-      - --dtype
-      - float16
-      - --max-model-len
-      - "4096"
-
-  recommender:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        - GIT_SHA=${GIT_SHA:-dev}
-    container_name: recommender
-    depends_on:
-      - qdrant
-      - ollama
-      - llama-stack
-    environment:
-      - LOG_LEVEL=INFO
-      - DEBUG=0
-      - OLLAMA_URL=http://ollama:11434
-      - EMBED_MODEL=nomic-embed-text
-      - QDRANT_URL=http://qdrant:6333
-      - QDRANT_COLLECTION=products_poc
-      - LLAMA_STACK_URL=http://llama-stack:8000
-      - MODEL_ID=meta-llama/Llama-3.2-3B-Instruct
-      - RECO_MAX_RESULTS=10
-      - RECO_SCORE_THRESHOLD=0.01
-    ports:
-      - "9000:9000"
-
-volumes:
-  qdrant_data:
-  ollama_data:
-```
-
 ### Build & run
 
 ```bash
@@ -141,11 +75,15 @@ docker compose ps
 
 ### 4.1 Embedding model (Ollama)
 
-Pull the embedding model (once):
+Make sure you have the correct models available in your Ollama instance.  
+Run the following commands to pull them:
 
 ```bash
-docker compose exec ollama ollama pull nomic-embed-text
-```
+# Download the LLaMA 3.2 3B model
+ollama pull llama3.2:3b
+
+# Download the nomic embed text model
+ollama pull nomic-embed-text:latest
 
 Test it:
 
@@ -166,12 +104,17 @@ curl -s http://localhost:8080/v1/models | jq
 Test chat:
 
 ```bash
-curl -s http://localhost:8080/v1/chat/completions   -H "Content-Type: application/json"   -d '{
-        "model":"meta-llama/Llama-3.2-3B-Instruct",
-        "messages":[{"role":"user","content":"Say hi in 5 words."}],
-        "temperature":0.0,
-        "max_tokens":50
-      }' | jq
+curl -s http://localhost:8080/v1/openai/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama3.2:3b",
+    "messages": [
+      {"role":"system","content":"You are a tester."},
+      {"role":"user","content":"Say OK"}
+    ],
+    "max_tokens": 8,
+    "temperature": 0
+  }' | jq
 ```
 
 ---
@@ -208,7 +151,22 @@ Index products into Qdrant.
 
 **Example**
 ```bash
-curl -s http://localhost:9000/index   -H "Content-Type: application/json"   -d @products.json | jq
+curl -s http://localhost:9000/index \
+  -H "Content-Type: application/json" \
+  --data-raw '{
+    "items":[
+      {"id":"sku-001","title":"Trailblazer Backpack","description":"50L backpack with hydration system","tags":["outdoor","backpack","hiking","travel","lightweight"]},
+      {"id":"sku-002","title":"Summit Tent","description":"2-person ultralight tent","tags":["outdoor","tent","camping","shelter","lightweight"]},
+      {"id":"sku-003","title":"Mountain Sleeping Bag","description":"Down sleeping bag rated -10C","tags":["outdoor","sleeping","bag","insulation","winter"]},
+      {"id":"sku-004","title":"Solar Charger Pro","description":"Portable 20W solar panel charger","tags":["electronics","solar","charger","outdoor","portable"]},
+      {"id":"sku-005","title":"NoiseCancel Pro Headphones","description":"Over-ear wireless headphones","tags":["electronics","audio","wireless","noise-cancelling","music"]},
+      {"id":"sku-006","title":"Smartwatch Fit","description":"Fitness smartwatch with GPS","tags":["electronics","wearable","fitness","gps","tracking"]},
+      {"id":"sku-007","title":"Running Shoes Pro","description":"Lightweight cushioned running shoes","tags":["shoes","running","fitness","lightweight","comfort"]},
+      {"id":"sku-008","title":"Climbing Rope","description":"Dynamic rope 60m UIAA certified","tags":["outdoor","climbing","rope","safety","gear"]},
+      {"id":"sku-009","title":"Yoga Mat Deluxe","description":"Eco-friendly non-slip yoga mat","tags":["fitness","yoga","mat","eco","workout"]},
+      {"id":"sku-010","title":"Hiking Poles","description":"Adjustable carbon trekking poles","tags":["outdoor","hiking","trekking","lightweight","support"]}
+    ]
+  }'
 ```
 
 ---
