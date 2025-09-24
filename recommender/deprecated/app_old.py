@@ -1,4 +1,4 @@
-import os
+""" import os
 import json
 import re
 import uuid
@@ -32,7 +32,7 @@ MODEL = os.getenv("MODEL_ID", "llama3.2:3b")
 MAX_RESULTS = int(os.getenv("RECO_MAX_RESULTS", "10"))
 SCORE_THRESHOLD = float(os.getenv("RECO_SCORE_THRESHOLD", "0.01"))
 
-app = FastAPI(title="POC Recommender", version="1.2.0")
+app = FastAPI(title="POC Recommender", version="1.7.1")
 
 # ---- Schemas ----
 class PrefsRecommendRequest(BaseModel):
@@ -167,7 +167,6 @@ def qdrant_recommend_by_items(
         body["negative"] = negative_qdrant_ids
     if exclude_skus:
         body["filter"] = {"must_not": [{"key": "sku", "match": {"any": list(exclude_skus)}}]}
-
     try:
         r = requests.post(
             f"{QDRANT}/collections/{QCOLL}/points/recommend",
@@ -265,7 +264,6 @@ def call_llm(system: str, user: str) -> str:
     except Exception as e:
         logger.exception("call_llm: parse error")
         raise HTTPException(500, f"LLM parse error: {e}")
-    # Log only the first 200 chars to avoid noise
     logger.debug("call_llm: content_head=%s", content[:200].replace("\n", "\\n"))
     return content
 
@@ -322,138 +320,200 @@ def index_products(body: IndexRequest):
     logger.info("index_products: indexed=%d", len(points))
     return {"indexed": len(points)}
 
-# ---- Recommend (LLM-assisted; unified scoring, LLM adds reasons only) ----
+# ---- Recommend (LLM suggestions from Qdrant candidates; human-friendly CTA) ----
 @app.post("/recommend/prefs_llm")
 def recommend_with_prefs_llm(body: PrefsRecommendRequest):
-    clicked = body.preferences.get("clicked", [])
-    carted  = body.preferences.get("added_to_cart", [])
-    bought  = body.preferences.get("bought", [])
-    positives = list({*clicked, *carted, *bought})
+    """
+""" Build suggestions using items from the vector DB:
+      - Use clicked/carted/bought as POSITIVE examples to Qdrant /recommend.
+      - Exclude clicked and added_to_cart from TARGETS; also exclude bought if exclude_bought=True.
+      - Let the LLM pick which TARGET from Qdrant options per source (we validate).
+      - Server assembles human-friendly CTA sentences prompting the user to view the target.
+    Returns: { customer_id, suggestions: [{text, source_sku, target_sku}] }
+    """
+"""
+    clicked = body.preferences.get("clicked", []) or []
+    carted  = body.preferences.get("added_to_cart", []) or []
+    bought  = body.preferences.get("bought", []) or []
+
     logger.info(
-        "prefs_llm: user=%s clicked=%d carted=%d bought=%d cand_limit=%d top_k=%d thr=%.3f",
-        body.customer_id, len(clicked), len(carted), len(bought), body.candidate_limit, body.top_k, SCORE_THRESHOLD
+        "prefs_llm(Qdrant-targets+CTA): user=%s clicked=%d carted=%d bought=%d top_k=%d exclude_bought=%s",
+        body.customer_id, len(clicked), len(carted), len(bought), body.top_k, body.exclude_bought
     )
 
-    signal_tags = build_signal_tags(clicked, carted, bought)
-    exclude_skus = set(bought) if body.exclude_bought else set()
+    positives = list({*clicked, *carted, *bought})
+    exclude_targets: Set[str] = set(clicked) | set(carted)
+    if body.exclude_bought:
+        exclude_targets |= set(bought)
 
-    candidates = []
+    candidates: List[Dict[str, Any]] = []
     if positives:
         candidates = qdrant_recommend_by_items(
             positive_skus=positives,
             negative_skus=[],
             limit=body.candidate_limit,
-            exclude_skus=exclude_skus,
+            exclude_skus=exclude_targets,
         )
-
-    clicked_payloads = qdrant_payload_for_skus(clicked)
-    carted_payloads  = qdrant_payload_for_skus(carted)
-    clicked_entries  = [{"payload": p} for p in clicked_payloads.values()]
-    carted_entries   = [{"payload": p} for p in carted_payloads.values()]
-    candidates = carted_entries + clicked_entries + (candidates or [])
-    logger.info("prefs_llm: candidates_after_inject=%d", len(candidates))
 
     if not candidates:
         vec = embed_texts(["diverse catalog best matches"])[0]
         candidates = qdrant_search(vec, limit=body.candidate_limit)
-        logger.info("prefs_llm: fallback_candidates=%d", len(candidates))
 
-    seen: Set[str] = set()
-    scored: List[Dict[str, Any]] = []
+    target_pool: List[Dict[str, str]] = []
+    seen_targets: Set[str] = set()
     for r in candidates:
-        payload = r.get("payload", {}) or {}
+        payload = r.get("payload") or {}
         sku = str(payload.get("sku") or r.get("id"))
-        if body.exclude_bought and sku in exclude_skus:
+        if not sku or sku in exclude_targets or sku in seen_targets:
             continue
-        if sku in seen:
-            continue
-        seen.add(sku)
+        title = str(payload.get("title") or sku)
+        target_pool.append({"sku": sku, "title": title})
+        seen_targets.add(sku)
+    logger.info("prefs_llm: target_pool_size=%d (after exclusions)", len(target_pool))
 
-        score, reasons, overlap_ratio, overlap_count = score_candidate_unified(
-            sku, payload, clicked, carted, bought, signal_tags
-        )
-        scored.append({
-            "id": sku,
-            "score": round(score, 4),
-            "reasons": reasons,
-            "overlap_tags_count": overlap_count,
-            "overlap_tags_ratio": round(overlap_ratio, 4),
-            "title": payload.get("title", ""),
-            "tags": payload.get("tags", []),
+    if not target_pool:
+        return {"customer_id": body.customer_id, "suggestions": []}
+
+    # Source info (for verbs and titles)
+    source_payloads = qdrant_payload_for_skus(list({*clicked, *carted, *bought}))
+    def title_for(sku: str) -> str:
+        p = source_payloads.get(sku) or {}
+        return str(p.get("title") or sku)
+
+    sources: List[Tuple[str, str, str]] = []
+    for sku in carted:
+        sources.append(("added_to_cart", sku, title_for(sku)))
+    for sku in clicked:
+        sources.append(("clicked", sku, title_for(sku)))
+    for sku in bought:
+        sources.append(("bought", sku, title_for(sku)))
+
+    if not sources:
+        return {"customer_id": body.customer_id, "suggestions": []}
+
+    # Give each source a small set of target options from Qdrant
+    OPTIONS_PER_SOURCE = min(8, len(target_pool))
+    per_source_options: Dict[str, List[Dict[str, str]]] = {}
+    ti = 0
+    for (_, src_sku, _) in sources:
+        options = []
+        tried = 0
+        while len(options) < OPTIONS_PER_SOURCE and tried < len(target_pool):
+            cand = target_pool[ti]
+            ti = (ti + 1) % len(target_pool)
+            tried += 1
+            if cand["sku"] == src_sku:
+                continue
+            options.append(cand)
+        if options:
+            per_source_options[src_sku] = options
+
+    sources = [s for s in sources if s[1] in per_source_options]
+    if not sources:
+        return {"customer_id": body.customer_id, "suggestions": []}
+
+    llm_items = []
+    for (_, src_sku, src_title) in sources:
+        llm_items.append({
+            "source_sku": src_sku,
+            "source_title": src_title,
+            "options": per_source_options[src_sku],  # [{sku,title}, ...]
         })
 
-    logger.info("prefs_llm: scored=%d", len(scored))
-
-    # Priority-aware sort: carted first, then clicked, then by score
-    carted_set  = set(carted)
-    clicked_set = set(clicked)
-    scored.sort(
-        key=lambda x: (
-            x["id"] in carted_set,
-            x["id"] in clicked_set,
-            x["score"]
-        ),
-        reverse=True
-    )
-
-    # Filter by threshold and cap results
-    max_out = min(body.top_k, MAX_RESULTS)
-    filtered = [x for x in scored if x["score"] >= SCORE_THRESHOLD]
-    top = filtered[:max_out]
-    logger.info("prefs_llm: filtered>=%.3f -> %d; returning=%d", SCORE_THRESHOLD, len(filtered), len(top))
-
-    # LLM: reasons only, same ids & scores
-    allowed_json = json.dumps(
-        [{"id": r["id"], "score": r["score"], "reasons": r["reasons"], "tags": r["tags"]} for r in top],
-        ensure_ascii=False
-    )
-    signal_tags_list = sorted(list(signal_tags))
     system = (
-        "You are a strict, deterministic product recommender.\n"
-        "OUTPUT: Only valid JSON. No text. No code fences.\n"
-        "Return exactly the items provided (same 'id' and 'score'); you may only adjust the 'reasons' array.\n"
-        "Allowed reason labels: ['clicked','added_to_cart','bought','tag_overlap'].\n"
-        "Use 'tag_overlap' ONLY if candidate tags intersect user signal tags."
+        "You are a concise e-commerce copywriter.\n"
+        "TASK: For each source item, select ONE target from the provided 'options' and write a short suggestion FRAGMENT about the TARGET only.\n"
+        "CONSTRAINTS:\n"
+        " - Choose the target strictly from the provided 'options' for that source.\n"
+        " - Do NOT mention what the user did (no 'viewed', 'added', 'bought', etc.).\n"
+        " - Use ONLY the provided titles; do NOT invent products.\n"
+        " - Keep each fragment under 100 characters.\n"
+        " - Tone: friendly and helpful.\n"
+        " - OUTPUT: JSON array only, no extra text, no code fences.\n"
+        '   Each object must be: {"source_sku": string, "target_sku": string, "fragment": string}.\n'
+        " - Avoid recommending the same target twice if possible."
     )
     user = (
-        f"User signal tags: {signal_tags_list}\n\n"
-        "Allowed output items (use exactly these ids and scores; do NOT change scores or add items):\n"
-        f"{allowed_json}\n\n"
-        'Return JSON strictly as {"recommendations":[{"id":"...","score":0-1,"reasons":[...]}, ...]}'
+        "Pick exactly one target for each item and return fragments:\n"
+        + json.dumps(llm_items, ensure_ascii=False)
+        + "\n\nReturn ONLY a JSON array like:\n"
+        + '[{"source_sku":"...","target_sku":"...","fragment":"..."}]'
     )
+
+    def action_verb(a: str) -> str:
+        return "viewed" if a == "clicked" else ("added to cart" if a == "added_to_cart" else "bought")
+
+    source_meta: Dict[str, Dict[str, str]] = {s[1]: {"action": s[0], "title": s[2]} for s in sources}
+    allowed_targets_per_source: Dict[str, Set[str]] = {
+        src: {opt["sku"] for opt in opts} for src, opts in per_source_options.items()
+    }
+    target_title_map: Dict[str, str] = {t["sku"]: t["title"] for t in target_pool}
+
+    # Human-friendly CTA templates (rotated)
+    CTAS = [
+        "take a look at",
+        "see more about",
+        "check out",
+        "have a look at",
+        "discover",
+        "view details for",
+    ]
 
     try:
         out = call_llm(system, user)
-        out_clean = re.sub(r"^```[a-zA-Z0-9]*\n|\n```$", "", out.strip())
+        out_clean = out.strip()
+        out_clean = re.sub(r"^```[a-zA-Z0-9]*\n|\n```$", "", out_clean)
         data = json.loads(out_clean)
-        items = data.get("recommendations", [])
-        allowed = {r["id"]: r["score"] for r in top}
-        final = []
-        for it in items:
-            i = str(it.get("id"))
-            s = it.get("score")
-            if i in allowed and abs(float(s) - allowed[i]) < 1e-6:
-                final.append({"id": i, "score": s, "reasons": it.get("reasons", [])})
-            if len(final) >= len(top):
-                break
-        # If LLM returns fewer, fill from deterministic top (no padding beyond filtered set)
-        kset = {f["id"] for f in final}
-        for r in top:
-            if r["id"] not in kset:
-                final.append({"id": r["id"], "score": r["score"], "reasons": r["reasons"]})
-                if len(final) >= len(top):
-                    break
+        if not isinstance(data, list):
+            raise ValueError("LLM did not return a JSON array")
 
-        logger.info("prefs_llm: final_return=%d", len(final))
-        return {"recommendations": final}
+        used_targets: Set[str] = set()
+        suggestions: List[Dict[str, str]] = []
+        for idx, obj in enumerate(data):
+            if len(suggestions) >= min(body.top_k, MAX_RESULTS):
+                break
+            if not isinstance(obj, dict):
+                continue
+            src = str(obj.get("source_sku", "")).strip()
+            tgt = str(obj.get("target_sku", "")).strip()
+            # Fragment is ignored for final wording; we build deterministic CTA
+            if not src or not tgt:
+                continue
+            if src not in source_meta:
+                continue
+            if tgt not in allowed_targets_per_source.get(src, set()):
+                continue
+            if tgt in used_targets:
+                continue
+            meta = source_meta[src]
+            verb = action_verb(meta["action"])
+            src_title = meta["title"]
+            tgt_title = target_title_map.get(tgt, tgt)
+            cta = CTAS[idx % len(CTAS)]
+            text = f'You {verb} “{src_title}” — {cta} “{tgt_title}”.'
+            suggestions.append({"text": text, "source_sku": src, "target_sku": tgt})
+            used_targets.add(tgt)
+
+        logger.info("prefs_llm: suggestions_returned=%d", len(suggestions))
+        return {"customer_id": body.customer_id, "suggestions": suggestions}
     except Exception as e:
-        logger.error("prefs_llm: LLM failure -> fallback. Error=%s", e)
-        logger.debug("prefs_llm: traceback:\n%s", traceback.format_exc())
-        resp = {"recommendations": [{"id": r["id"], "score": r["score"], "reasons": r["reasons"]} for r in top],
-                "note": "llm-fallback"}
-        if DEBUG:
-            resp["error"] = str(e)
-        return resp
+        logger.error("prefs_llm: LLM failure -> fallback using first options. Error=%s", e)
+        logger.debug("prefs_llm traceback:\n%s", traceback.format_exc())
+        suggestions: List[Dict[str, str]] = []
+        used_targets: Set[str] = set()
+        for idx, (action, src_sku, src_title) in enumerate(sources):
+            if len(suggestions) >= min(body.top_k, MAX_RESULTS):
+                break
+            for opt in per_source_options.get(src_sku, []):
+                if opt["sku"] != src_sku and opt["sku"] not in used_targets:
+                    verb = action_verb(action)
+                    cta = CTAS[idx % len(CTAS)]
+                    tgt_title = opt["title"]
+                    text = f'You {verb} “{src_title}” — {cta} “{tgt_title}”.'
+                    suggestions.append({"text": text, "source_sku": src_sku, "target_sku": opt["sku"]})
+                    used_targets.add(opt["sku"])
+                    break
+        return {"customer_id": body.customer_id, "suggestions": suggestions}
 
 # ---- Recommend (Points-only; same unified scoring) ----
 @app.post("/recommend/prefs_points")
@@ -489,7 +549,7 @@ def recommend_with_points(body: PrefsRecommendRequest):
     if not candidates:
         vec = embed_texts(["diverse catalog best matches"])[0]
         candidates = qdrant_search(vec, body.candidate_limit)
-        logger.info("prefs_points: fallback_candidates=%d", len(candidates))
+    logger.info("prefs_points: fallback_candidates=%d", len(candidates if candidates else []))
 
     seen: Set[str] = set()
     scored: List[Dict[str, Any]] = []
@@ -511,11 +571,11 @@ def recommend_with_points(body: PrefsRecommendRequest):
             "reasons": reasons,
             "overlap_tags_count": overlap_count,
             "overlap_tags_ratio": round(overlap_ratio, 4),
+            "title": payload.get("title", ""),   # include title for downstream return
         })
 
     logger.info("prefs_points: scored=%d", len(scored))
 
-    # Priority-aware sort, then filter by threshold and cap
     carted_set  = set(carted)
     clicked_set = set(clicked)
     scored.sort(
@@ -532,4 +592,4 @@ def recommend_with_points(body: PrefsRecommendRequest):
     top = filtered[:max_out]
     logger.info("prefs_points: filtered>=%.3f -> %d; returning=%d", SCORE_THRESHOLD, len(filtered), len(top))
 
-    return {"recommendations": top}
+    return {"recommendations": top} """

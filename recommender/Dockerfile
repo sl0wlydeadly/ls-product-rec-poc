@@ -1,11 +1,17 @@
 FROM python:3.11-slim
 
 WORKDIR /app
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-RUN pip install --no-cache-dir fastapi uvicorn requests
+# Install deps
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir fastapi uvicorn[standard] requests
 
-COPY app.py /app/app.py
+# Copy source (all the split modules)
+COPY *.py /app/
 
 EXPOSE 9000
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "9000"]
+
+# Run the FastAPI app from main.py (object: app)
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9000"]
