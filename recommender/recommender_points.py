@@ -5,7 +5,7 @@ from embeddings import embed_texts
 from qdrant import (
     qdrant_recommend_by_items, qdrant_payload_for_skus, qdrant_search
 )
-from scoring import score_candidate_unified, jaccard  # jaccard imported for clarity
+from scoring import score_candidate_unified, jaccard
 
 logger = logging.getLogger("recommender")
 
@@ -72,7 +72,7 @@ def recommend_points(body) -> Dict[str, Any]:
             "reasons": reasons,
             "overlap_tags_count": overlap_count,
             "overlap_tags_ratio": round(overlap_ratio, 4),
-            "title": payload.get("title", ""),   # titles included per your last change
+            "title": payload.get("title", ""),
         })
 
     logger.info("prefs_points: scored=%d", len(scored))

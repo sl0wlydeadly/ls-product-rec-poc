@@ -27,15 +27,6 @@ services:
     environment:
       - OLLAMA_ORIGINS=*        
     networks: [ai]
-    # allow local cross-origin during PoC
-    # GPU: uncomment ONE of the two depending on your Docker setup:
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - capabilities: [gpu]
-    # OR (non-Swarm Docker):
-    # runtime: nvidia
 
   llama-stack:
     image: llamastack/distribution-ollama:latest
@@ -45,7 +36,6 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
-    # IMPORTANT: this image expects flags (no "llama-stack server start ...")
     command: >
       --port 8080
       --env INFERENCE_MODEL=llama3.2:3b
@@ -53,7 +43,6 @@ services:
       --env OLLAMA_URL=http://ollama:11434
     networks: [ai]
 
-  # Optional vector DB for embeddings, similarity, etc.
   qdrant:
     image: qdrant/qdrant:latest
     container_name: qdrant
@@ -81,26 +70,5 @@ services:
       - llama-stack
     ports:
       - "9000:9000"
-    networks: [ai]
-    logging: *default-logging
-
-  # Optional: build flows, webhooks, scheduled jobs in front of the API
-  n8n:
-    image: n8nio/n8n:latest
-    container_name: n8n
-    restart: unless-stopped
-    environment:
-      - N8N_HOST=n8n.local
-      - N8N_PORT=5678
-      - WEBHOOK_URL=http://localhost:5678
-      - TZ=Europe/Berlin
-      - N8N_DIAGNOSTICS_ENABLED=false
-      - N8N_VERSION_NOTIFICATIONS_ENABLED=false
-    ports:
-      - "5678:5678"
-    volumes:
-      - n8n_data:/home/node/.n8n
-    depends_on:
-      - recommender
     networks: [ai]
     logging: *default-logging
