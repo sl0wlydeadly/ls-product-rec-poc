@@ -1,8 +1,0 @@
-{
-  "items": [
-    {"id":"sku-101","title":"AeroTrail Shoes","description":"Cushioned trail runners","tags":["trail","shoes","grip"]},
-    {"id":"sku-202","title":"Summit 20L Pack","description":"Light daypack with hydration sleeve","tags":["backpack","lightweight"]},
-    {"id":"sku-303","title":"City Sneaks","description":"Casual sneakers","tags":["lifestyle"]},
-    {"id":"sku-404","title":"ThermoBottle","description":"Insulated 1L water bottle","tags":["hydration","bottle"]}
-  ]
-}

@@ -9,7 +9,7 @@ OLLAMA = os.getenv("OLLAMA_URL", "http://ollama:11434")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
 QDRANT = os.getenv("QDRANT_URL", "http://qdrant:6333")
 QCOLL = os.getenv("QDRANT_COLLECTION", "products_poc")
-LLAMA = os.getenv("LLAMA_STACK_URL", "http://llama-stack:8080")
+LLAMA = os.getenv("LLAMA_STACK_URL", "http://llama-stack:8080/v1/openai")
 MODEL = os.getenv("MODEL_ID", "llama3.2:3b")
 
 # Recommender knobs
